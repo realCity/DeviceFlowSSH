@@ -25,6 +25,7 @@ under the License.
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <syslog.h>
 
 #include <curl/curl.h>
 #include <security/pam_appl.h>
@@ -33,10 +34,6 @@ under the License.
 
 /* needed for base64 decoder */
 #include <openssl/pem.h>
-
-#define DEVICE_AUTHORIZE_URL  "https://dev-57525606.okta.com/oauth2/v1/device/authorize"
-#define TOKEN_URL "https://dev-57525606.okta.com/oauth2/v1/token"
-#define CLIENT_ID "0oa15wulqt5yqD9FP5d7"
 
 /* structure used for curl return */
 struct MemoryStruct {
@@ -87,8 +84,9 @@ char * getValueForKey(char * in, const char * key) {
 	char * token = strtok(in, "\"");
         while ( token != NULL ) {
         	if (!strcmp(token, key)) {
+                    // https://stackoverflow.com/a/72103956/2891426
                 	token = strtok(NULL, "\""); /* skip : */
-                        token = strtok(NULL, "\"");
+                    token = strtok(NULL, "\"");
 			return token;
 		}
 		token = strtok(NULL, "\"");
@@ -99,7 +97,7 @@ char * getValueForKey(char * in, const char * key) {
 CURL *curl;
 struct MemoryStruct chunk;
 
-void issuePost(char * url, char * data) {
+void issuePost(const char * url, char * data) {
         /* send all data to this function  */
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
         /* we pass our 'chunk' struct to the callback function */
@@ -115,11 +113,7 @@ void issuePost(char * url, char * data) {
 void
 sendPAMMessage(pam_handle_t *pamh, char * prompt_message) {
         int retval;
-	//char * resp;
-        
-//	retval = pam_prompt(pamh, PAM_TEXT_INFO, &resp, "%s", prompt_message);
-      
-	struct pam_message msg[1],*pmsg[1];
+	    struct pam_message msg[1],*pmsg[1];
         struct pam_response *resp;
         struct pam_conv *conv ;
 
@@ -147,12 +141,78 @@ PAM_EXTERN int pam_sm_setcred( pam_handle_t *pamh, int flags, int argc, const ch
         return PAM_SUCCESS ;
 }
 
-/* expected hook, this is where custom stuff happens */
-PAM_EXTERN int pam_sm_authenticate( pam_handle_t *pamh, int flags,int argc, const char **argv ) {
-        int res ;
-	char postData[1024];
+void print_log(pam_handle_t *pamh, int priority, const char * fmt, ...) {
+    char log_str[9999];
+    va_list arglist;
+    va_start( arglist, fmt );
+    vsprintf(log_str, fmt, arglist);
+    va_end( arglist );
 
-        fprintf(stderr, "starting\n");
+    pam_syslog(pamh, priority, "%s", log_str);
+    fprintf(stderr, "%s", log_str);
+    fprintf(stderr, "\n");
+}
+
+/* expected hook, this is where custom stuff happens */
+PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags, int argc, const char **argv ) {
+        int res ;
+	    char postData[1024];
+
+        const char * clientId = NULL;
+        const char * tokenUrl = NULL;
+        const char * deviceUrl = NULL;
+        const char * roleFieldName = NULL;
+        const char * requiredRole = NULL;
+
+        print_log(pamh, LOG_INFO, "argument parsing started");
+        for(int i = 0; i < argc; i++) {
+            const char * argument = argv[i];
+            print_log(pamh, LOG_INFO, "parsing arguments: %s", argv[i]);
+            if (strstr(argument, "client_id=")) {
+                clientId = argument+10;
+                print_log(pamh, LOG_INFO, "client id is: `%s`", clientId);
+            }
+            if (strstr(argument, "token_url=")) {
+                tokenUrl = argument+10;
+                print_log(pamh, LOG_INFO, "token url is: `%s`", tokenUrl);
+            }
+            if (strstr(argument, "device_url=")) {
+                deviceUrl = argument+11;
+                print_log(pamh, LOG_INFO, "device url is: `%s`", deviceUrl);
+            }
+            if (strstr(argument, "role_field_name=")) {
+                roleFieldName = argument+16;
+                print_log(pamh, LOG_INFO, "role field name is: `%s`", roleFieldName);
+            }
+            if (strstr(argument, "required_role=")) {
+                requiredRole = argument+14;
+                print_log(pamh, LOG_INFO, "required role is: `%s`", requiredRole);
+            }
+        }
+        print_log(pamh, LOG_INFO, "argument parsing ended");
+
+        if (clientId == NULL && tokenUrl == NULL && deviceUrl == NULL) {
+            if (clientId == NULL) {
+                print_log(pamh, LOG_ERR, "client_id parameter is not provided!");
+            }
+            if (tokenUrl == NULL) {
+                print_log(pamh, LOG_ERR, "token_url parameter is not provided!");
+            }
+            if (deviceUrl == NULL) {
+                print_log(pamh, LOG_ERR, "device_url parameter is not provided!");
+            }
+            return PAM_AUTH_ERR;
+        }
+
+        if ((requiredRole == NULL && roleFieldName != NULL) || (requiredRole != NULL && roleFieldName == NULL)) {
+            print_log(pamh, LOG_ERR, "role_field_name and required_role can only be used together");
+            return PAM_AUTH_ERR;
+        }
+
+        // test that we can log to syslog & we can acquire the given username from the login
+	    const char *user;
+	    pam_get_user(pamh, &user, NULL);
+        print_log(pamh, LOG_ERR, "log & username testing for user: `%s`", user);
 
         /* memory for curl return */
         chunk.memory = malloc(1);  /* will be grown as needed by the realloc above */
@@ -163,67 +223,80 @@ PAM_EXTERN int pam_sm_authenticate( pam_handle_t *pamh, int flags,int argc, cons
         curl = curl_easy_init();
 
         /* hold temp string */
-        char str1[4096], str2[1024], str3[1024];;
+        char str1[9999], str2[1024], str3[1024];
 
         /* call authorize end point */
-	sprintf(postData, "client_id=%s&scope=openid profile offline_access", CLIENT_ID); 
-        issuePost(DEVICE_AUTHORIZE_URL, postData);
+	    sprintf(postData, "client_id=%s&scope=openid profile", clientId);
+        issuePost(deviceUrl, postData);
 
-	strcpy(str1, chunk.memory);
+	    strcpy(str1, chunk.memory);
         char * usercode = getValueForKey(str1, "user_code");
-	strcpy(str2, chunk.memory);
+	    strcpy(str2, chunk.memory);
         char * devicecode = getValueForKey(str2, "device_code");
-	strcpy(str3, chunk.memory);
-	char * activateUrl = getValueForKey(str3, "verification_uri_complete");
+	    strcpy(str3, chunk.memory);
+	    char * activateUrl = getValueForKey(str3, "verification_uri_complete");
         printf("auth: %s %s\n", usercode, devicecode);
 
-	char prompt_message[2000];
+	    char prompt_message[2000];
         char * qrc = getQR(activateUrl);
-  	sprintf(prompt_message, "\n\nPlease login at %s or scan the QRCode below:\n\n%s", activateUrl, qrc );
+  	    sprintf(prompt_message, "\n\nPlease login at %s or scan the QRCode below:\n\n%s", activateUrl, qrc );
         free(qrc);
         sendPAMMessage(pamh, prompt_message);
 
-	/* work around SSH PAM bug that buffers PAM_TEXT_INFO */ 
-	char * resp;
+	    /* work around SSH PAM bug that buffers PAM_TEXT_INFO */
+	    char * resp;
         res = pam_prompt(pamh, PAM_PROMPT_ECHO_ON, &resp, "Press Enter to continue:");
 
-        int waitingForActivate = 1;
-        sprintf(postData, "device_code=%s&grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=%s", devicecode, CLIENT_ID);
+        int waitingForActivate = 10;
+        sprintf(postData, "device_code=%s&grant_type=urn:ietf:params:oauth:grant-type:device_code&client_id=%s", devicecode, clientId);
 
         while (waitingForActivate) {
-                // sendPAMMessage(pamh, "Waiting for user activation");
-
+                print_log(pamh, LOG_INFO, "Sending `%s` to `%s`", postData, tokenUrl);
                 chunk.size = 0;
-                issuePost(TOKEN_URL, postData);
-
-		strcpy(str1, chunk.memory);
+                issuePost(tokenUrl, postData);
+		        strcpy(str1, chunk.memory);
+                print_log(pamh, LOG_INFO, "response length: `%d`", strlen(str1));
                 char * errormsg = getValueForKey(str1, "error");
                 if (errormsg == NULL) {
+			        /* Parse response to find id_token, then find payload, then find name claim */
+			        char * idtoken = getValueForKey(chunk.memory, "id_token");
+			        char * header = strtok(idtoken, ".");
+			        char * payload = strtok(NULL, ".");
+                    char * decoded = base64decode(payload, strlen(payload));
+                    strcpy(str1, decoded);
+                    char * name = getValueForKey(str1, "name");
+                    if (roleFieldName != NULL) {
+                        strcpy(str1, decoded);
+                        char * roles = getValueForKey(str1, roleFieldName);
+                        if (strstr(roles, requiredRole)) {
+                            print_log(pamh, LOG_INFO, "User has the required role `%s`. The user's roles are: `%s`", requiredRole, roles);
+                        } else {
+                            print_log(pamh, LOG_INFO, "User does not have the required role `%s`. The user's roles are: `%s`", requiredRole, roles);
+                            sprintf(prompt_message, "You don't have the required role to login to this machine.");
+                            sendPAMMessage(pamh, prompt_message);
+                            return PAM_PERM_DENIED;
+                        }
+                    }
 
-			/* Parse response to find id_token, then find payload, then find name claim */
-			char * idtoken = getValueForKey(chunk.memory, "id_token");
+                    sprintf(prompt_message, "\n\n*********************************\n  Welcome, %s\n*********************************\n\n\n", name);
+                    sendPAMMessage(pamh, prompt_message);
+                    if (curl) {
+                        curl_easy_cleanup( curl ) ;
+                    }
+                    curl_global_cleanup();
 
-			char * header = strtok(idtoken, ".");
-			char * payload = strtok(NULL, ".");
-
-			char * decoded = base64decode(payload, strlen(payload));
-
-			char * name = getValueForKey(decoded, "name");
-
-			sprintf(prompt_message, "\n\n*********************************\n  Welcome, %s\n*********************************\n\n\n", name);
-			sendPAMMessage(pamh, prompt_message);
-
-                        if (curl) curl_easy_cleanup( curl ) ;
-                        curl_global_cleanup();
-
-                        return PAM_SUCCESS;
+			        pam_set_item(pamh, PAM_AUTHTOK, "ok");
+                    return PAM_SUCCESS;
                 }
+                chunk.size = 0;
                 printf("error %s\n", errormsg);
                 sleep(5);
+                waitingForActivate--;
         }
         /* Curl clean up */
-        if (curl) curl_easy_cleanup( curl ) ;
+        if (curl) {
+            curl_easy_cleanup(curl);
+        }
         curl_global_cleanup();
-
         return PAM_AUTH_ERR;
 }
